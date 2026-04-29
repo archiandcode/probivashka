@@ -12,6 +12,9 @@ FROM alpine:3.22
 
 WORKDIR /app
 
+RUN apk add --no-cache ca-certificates \
+	&& update-ca-certificates
+
 COPY --from=build /probivashka /usr/local/bin/probivashka
 COPY --from=build /app/index.html /app/index.html
 
