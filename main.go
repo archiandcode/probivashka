@@ -3,8 +3,8 @@ package main
 import (
 	"archive/zip"
 	"bytes"
-	"crypto/tls"
 	"crypto/sha1"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
@@ -1510,24 +1510,64 @@ func computeWebSocketAccept(key string) string {
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
+type wsFrame struct {
+	final   bool
+	opcode  byte
+	payload []byte
+}
+
 func readClientTextFrame(r io.Reader) ([]byte, error) {
+	var message []byte
+	var started bool
+
+	for {
+		frame, err := readClientFrame(r)
+		if err != nil {
+			return nil, err
+		}
+
+		switch frame.opcode {
+		case 0x8:
+			return nil, io.EOF
+		case 0x9, 0xA:
+			if !frame.final {
+				return nil, errors.New("fragmented control websocket frames are not supported")
+			}
+			continue
+		case 0x1:
+			if started {
+				return nil, errors.New("получено новое websocket сообщение до завершения предыдущего")
+			}
+			started = true
+		case 0x0:
+			if !started {
+				return nil, errors.New("получен continuation websocket frame без начального текстового сообщения")
+			}
+		default:
+			return nil, errors.New("поддерживаются только текстовые websocket сообщения")
+		}
+
+		if int64(len(message))+int64(len(frame.payload)) > 128*1024*1024 {
+			return nil, errors.New("слишком большой websocket payload")
+		}
+		message = append(message, frame.payload...)
+
+		if frame.final {
+			return message, nil
+		}
+	}
+}
+
+func readClientFrame(r io.Reader) (wsFrame, error) {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(r, header); err != nil {
-		return nil, err
+		return wsFrame{}, err
 	}
 
+	final := header[0]&0x80 != 0
 	opcode := header[0] & 0x0F
-	if opcode == 0x8 {
-		return nil, io.EOF
-	}
-	if opcode != 0x1 {
-		return nil, errors.New("поддерживаются только текстовые websocket сообщения")
-	}
-	if header[0]&0x80 == 0 {
-		return nil, errors.New("fragmented websocket frames are not supported")
-	}
 	if header[1]&0x80 == 0 {
-		return nil, errors.New("client websocket frame must be masked")
+		return wsFrame{}, errors.New("client websocket frame must be masked")
 	}
 
 	payloadLen := int64(header[1] & 0x7F)
@@ -1535,36 +1575,40 @@ func readClientTextFrame(r io.Reader) ([]byte, error) {
 	case 126:
 		extended := make([]byte, 2)
 		if _, err := io.ReadFull(r, extended); err != nil {
-			return nil, err
+			return wsFrame{}, err
 		}
 		payloadLen = int64(binary.BigEndian.Uint16(extended))
 	case 127:
 		extended := make([]byte, 8)
 		if _, err := io.ReadFull(r, extended); err != nil {
-			return nil, err
+			return wsFrame{}, err
 		}
 		payloadLen = int64(binary.BigEndian.Uint64(extended))
 	}
 
 	if payloadLen > 128*1024*1024 {
-		return nil, errors.New("слишком большой websocket payload")
+		return wsFrame{}, errors.New("слишком большой websocket payload")
 	}
 
 	mask := make([]byte, 4)
 	if _, err := io.ReadFull(r, mask); err != nil {
-		return nil, err
+		return wsFrame{}, err
 	}
 
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, err
+		return wsFrame{}, err
 	}
 
 	for i := range payload {
 		payload[i] ^= mask[i%4]
 	}
 
-	return payload, nil
+	return wsFrame{
+		final:   final,
+		opcode:  opcode,
+		payload: payload,
+	}, nil
 }
 
 func writeServerJSON(w io.Writer, message wsMessage) error {
