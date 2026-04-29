@@ -3,7 +3,9 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/tls"
 	"crypto/sha1"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -17,6 +19,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,6 +27,52 @@ const (
 	baseURL     = "https://aisoip.adilet.gov.kz/extperson"
 	workerCount = 8
 )
+
+var (
+	httpClient     *http.Client
+	httpClientErr  error
+	httpClientOnce sync.Once
+)
+
+func getHTTPClient() (*http.Client, error) {
+	httpClientOnce.Do(func() {
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			httpClientErr = fmt.Errorf("не удалось загрузить системные сертификаты: %w", err)
+			return
+		}
+		if pool == nil {
+			pool = x509.NewCertPool()
+		}
+
+		extraCertFile := strings.TrimSpace(os.Getenv("EXTRA_CA_CERT_FILE"))
+		if extraCertFile != "" {
+			pemData, err := os.ReadFile(extraCertFile)
+			if err != nil {
+				httpClientErr = fmt.Errorf("не удалось прочитать EXTRA_CA_CERT_FILE=%q: %w", extraCertFile, err)
+				return
+			}
+			if ok := pool.AppendCertsFromPEM(pemData); !ok {
+				httpClientErr = fmt.Errorf("файл EXTRA_CA_CERT_FILE=%q не содержит PEM-сертификатов", extraCertFile)
+				return
+			}
+			log.Printf("добавлен дополнительный CA сертификат из %s", extraCertFile)
+		}
+
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.TLSClientConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    pool,
+		}
+
+		httpClient = &http.Client{
+			Timeout:   60 * time.Second,
+			Transport: transport,
+		}
+	})
+
+	return httpClient, httpClientErr
+}
 
 var exportColumns = []exportColumn{
 	{Header: "Номер исполнительного производства", Path: "execProcNum"},
@@ -629,7 +678,10 @@ func fetchArrestInfo(baseURL, session, execProcNum string) (map[string]any, erro
 	req.Header.Set("Referer", strings.TrimRight(baseURL, "/")+"/cabinet/claimant-arrests")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36")
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	client, err := getHTTPClient()
+	if err != nil {
+		return nil, err
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка запроса: %w", err)
