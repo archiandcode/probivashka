@@ -25,7 +25,7 @@ import (
 
 const (
 	baseURL     = "https://aisoip.adilet.gov.kz/extperson"
-	workerCount = 8
+	workerCount = 64
 )
 
 var (
