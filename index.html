@@ -66,6 +66,35 @@
       gap: 16px;
     }
 
+    .tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .tab-button {
+      align-self: auto;
+      margin-bottom: -1px;
+      padding: 10px 14px;
+      border: 1px solid transparent;
+      border-bottom-color: var(--line);
+      border-radius: 6px 6px 0 0;
+      background: transparent;
+      color: var(--muted);
+    }
+
+    .tab-button.active {
+      border-color: var(--line);
+      border-bottom-color: var(--panel);
+      background: var(--panel);
+      color: var(--ink);
+    }
+
+    .tab-panel[hidden] {
+      display: none;
+    }
+
     .field {
       margin-bottom: 12px;
     }
@@ -81,7 +110,9 @@
     }
 
     input[type="text"],
-    input[type="file"] {
+    input[type="date"],
+    input[type="file"],
+    select {
       width: 100%;
       padding: 10px 12px;
       border: 1px solid var(--line);
@@ -92,7 +123,9 @@
     }
 
     input[type="text"]:focus,
-    input[type="file"]:focus {
+    input[type="date"]:focus,
+    input[type="file"]:focus,
+    select:focus {
       outline: 2px solid rgba(31, 111, 235, 0.18);
       border-color: var(--accent);
     }
@@ -167,6 +200,13 @@
       background: #f6fff8;
     }
 
+    .log {
+      min-height: 260px;
+      max-height: 420px;
+      overflow: auto;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
     .bar {
       height: 10px;
       margin-top: 12px;
@@ -203,12 +243,17 @@
 </head>
 <body>
   <main class="page">
+    <nav class="tabs" aria-label="Страницы">
+      <button class="tab-button active" type="button" data-tab="page1">Проверка ИП</button>
+      <button class="tab-button" type="button" data-tab="page2">Исполнительные производства</button>
+    </nav>
+
     <div class="panel" style="margin-bottom: 16px;">
       <h1>Выгрузка ИП</h1>
       <p>Загрузите файл с номерами, вставьте ключ сессии и выберите, какие разделы нужно выгрузить.</p>
     </div>
 
-    <section class="layout">
+    <section id="page1" class="tab-panel layout">
       <div class="stack">
         <section class="panel">
           <h2>Параметры</h2>
@@ -296,9 +341,55 @@
         </div>
       </aside>
     </section>
+
+    <section id="page2" class="tab-panel layout" hidden>
+      <div class="stack">
+        <section class="panel">
+          <h2>Параметры выгрузки</h2>
+          <div class="field">
+            <label class="block" for="execSessionKey">SESSION</label>
+            <input id="execSessionKey" type="text" placeholder="SESSION">
+          </div>
+
+        </section>
+
+        <section class="panel">
+          <h2>Статусы</h2>
+          <div class="field">
+            <label class="block" for="execStatuses">STATUS</label>
+            <select id="execStatuses">
+              <option value="">Все</option>
+              <option value="1">1 - На исполнении</option>
+              <option value="2">2 - Отказано в возбуждении</option>
+              <option value="3">3 - Возврат без исполнения</option>
+              <option value="50">50 - Окончено</option>
+              <option value="51">51 - Приостановлено</option>
+              <option value="52">52 - Направлено по территории</option>
+            </select>
+            <div class="hint">При выборе “Все” запрос отправляется без statusCode.</div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="actions">
+            <button id="execStartButton" type="button">Запустить выгрузку</button>
+            <span class="meta">Промежуточные файлы сохраняются в downloads, итоговый файл сохраняется как result.xlsx и скачивается в браузере.</span>
+          </div>
+        </section>
+      </div>
+
+      <aside class="panel">
+        <h2>Статус</h2>
+        <div id="execStatus" class="status log">Ожидание запуска.</div>
+        <div class="bar"><div id="execProgressBar"></div></div>
+        <div id="execSummary" class="summary">Сначала строятся диапазоны до 10 000 записей, затем Excel выгружается последовательно.</div>
+      </aside>
+    </section>
   </main>
 
   <script>
+    const tabButtons = Array.from(document.querySelectorAll(".tab-button"));
+    const tabPanels = Array.from(document.querySelectorAll(".tab-panel"));
     const sessionKeyInput = document.getElementById("sessionKey");
     const sourceFileInput = document.getElementById("sourceFile");
     const selectAllInput = document.getElementById("selectAll");
@@ -307,6 +398,26 @@
     const statusBox = document.getElementById("status");
     const progressBar = document.getElementById("progressBar");
     const summaryBox = document.getElementById("summary");
+    const execSessionKeyInput = document.getElementById("execSessionKey");
+    const execStatusesSelect = document.getElementById("execStatuses");
+    const execStartButton = document.getElementById("execStartButton");
+    const execStatusBox = document.getElementById("execStatus");
+    const execProgressBar = document.getElementById("execProgressBar");
+    const execSummaryBox = document.getElementById("execSummary");
+
+    tabButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        const tabId = button.dataset.tab;
+
+        tabButtons.forEach((item) => {
+          item.classList.toggle("active", item === button);
+        });
+
+        tabPanels.forEach((panel) => {
+          panel.hidden = panel.id !== tabId;
+        });
+      });
+    });
 
     selectAllInput.addEventListener("change", () => {
       optionInputs.forEach((input) => {
@@ -394,8 +505,81 @@
       }
     });
 
+    execStartButton.addEventListener("click", () => {
+      const sessionKey = execSessionKeyInput.value.trim();
+      const status = execStatusesSelect.value;
+
+      if (!sessionKey) {
+        setExecStatus("Введите SESSION.", true);
+        return;
+      }
+
+      setExecBusy(true);
+      setExecStatus("Подключаюсь к серверу...");
+      setExecProgress(0);
+      execSummaryBox.textContent = "Выгрузка запущена.";
+
+      const socket = new WebSocket(buildWsUrl("/execproc-ws"));
+
+      socket.addEventListener("open", () => {
+        socket.send(JSON.stringify({
+          type: "execproc-start",
+          sessionKey,
+          statuses: status ? [status] : []
+        }));
+      });
+
+      socket.addEventListener("message", (event) => {
+        const data = JSON.parse(event.data);
+
+        if (data.type === "log") {
+          appendExecLog(data.message || "");
+          return;
+        }
+
+        if (data.type === "progress") {
+          const percent = data.total ? Math.round((data.current / data.total) * 100) : 0;
+          setExecProgress(percent);
+          execSummaryBox.textContent = `${data.status || "Выгрузка"} • ${percent}%`;
+          return;
+        }
+
+        if (data.type === "result") {
+          setExecProgress(100);
+          appendExecLog(`Готово. Строк: ${data.processed || 0}, дублей удалено: ${data.failed || 0}.`);
+          execStatusBox.classList.add("ok");
+          execSummaryBox.textContent = "Итоговый файл готов. Загрузка начнётся автоматически.";
+          downloadBase64File(data.fileBase64, data.fileName || "result.xlsx");
+          setExecBusy(false);
+          socket.close();
+          return;
+        }
+
+        if (data.type === "error") {
+          appendExecLog(data.message || "Ошибка выгрузки.");
+          execStatusBox.classList.add("error");
+          setExecBusy(false);
+          socket.close();
+        }
+      });
+
+      socket.addEventListener("error", () => {
+        appendExecLog("Ошибка соединения.");
+        execStatusBox.classList.add("error");
+        setExecBusy(false);
+      });
+
+      socket.addEventListener("close", () => {
+        setExecBusy(false);
+      });
+    });
+
     function setBusy(isBusy) {
       startButton.disabled = isBusy;
+    }
+
+    function setExecBusy(isBusy) {
+      execStartButton.disabled = isBusy;
     }
 
     function collectOptions() {
@@ -412,8 +596,27 @@
       statusBox.classList.toggle("ok", isOk && !isError);
     }
 
+    function setExecStatus(text, isError = false) {
+      execStatusBox.textContent = text;
+      execStatusBox.classList.toggle("error", isError);
+      execStatusBox.classList.toggle("ok", false);
+    }
+
+    function appendExecLog(text) {
+      const current = execStatusBox.textContent === "Ожидание запуска." || execStatusBox.textContent === "Подключаюсь к серверу..."
+        ? ""
+        : execStatusBox.textContent + "\n";
+      execStatusBox.textContent = current + text;
+      execStatusBox.scrollTop = execStatusBox.scrollHeight;
+      execStatusBox.classList.remove("error");
+    }
+
     function setProgress(value) {
       progressBar.style.width = `${Math.max(0, Math.min(100, value))}%`;
+    }
+
+    function setExecProgress(value) {
+      execProgressBar.style.width = `${Math.max(0, Math.min(100, value))}%`;
     }
 
     function buildWsUrl(path) {

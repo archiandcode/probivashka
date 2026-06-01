@@ -17,6 +17,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -172,6 +174,7 @@ type xlsxRow struct {
 }
 
 type xlsxCell struct {
+	Ref       string `xml:"r,attr"`
 	Type      string `xml:"t,attr"`
 	Value     string `xml:"v"`
 	InlineStr struct {
@@ -195,6 +198,15 @@ type startRequest struct {
 	FileBase64 string          `json:"fileBase64"`
 	SelectAll  bool            `json:"selectAll"`
 	Options    map[string]bool `json:"options"`
+}
+
+type execExportRequest struct {
+	Type        string   `json:"type"`
+	SessionKey  string   `json:"sessionKey"`
+	StartDate   string   `json:"startDate"`
+	Statuses    []string `json:"statuses"`
+	OutputFile  string   `json:"outputFile"`
+	DownloadDir string   `json:"downloadDir"`
 }
 
 type downloadFile struct {
@@ -244,6 +256,7 @@ func main() {
 
 	http.HandleFunc("/", serveIndex)
 	http.HandleFunc("/ws", handleWebSocket)
+	http.HandleFunc("/execproc-ws", handleExecProcWebSocket)
 
 	log.Printf("HTTP server started on http://localhost%s", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
@@ -557,7 +570,743 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	_ = writeServerJSON(conn, resultMessage)
 }
 
+func handleExecProcWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgradeToWebSocket(w, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer conn.Close()
+
+	payload, err := readClientTextFrame(conn)
+	if err != nil {
+		_ = writeServerJSON(conn, wsMessage{Type: "error", Message: err.Error()})
+		return
+	}
+
+	var req execExportRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		_ = writeServerJSON(conn, wsMessage{Type: "error", Message: "не удалось разобрать запрос выгрузки"})
+		return
+	}
+
+	if strings.TrimSpace(req.SessionKey) == "" {
+		_ = writeServerJSON(conn, wsMessage{Type: "error", Message: "SESSION обязателен"})
+		return
+	}
+
+	startDate := strings.TrimSpace(req.StartDate)
+	if startDate == "" {
+		startDate = "2017-01-01"
+	}
+	if _, err := time.Parse("2006-01-02", startDate); err != nil {
+		_ = writeServerJSON(conn, wsMessage{Type: "error", Message: "START_DATE должен быть в формате YYYY-MM-DD"})
+		return
+	}
+
+	statuses := normalizeStatuses(req.Statuses)
+	if len(statuses) == 0 {
+		_ = writeServerJSON(conn, wsMessage{Type: "error", Message: "выберите хотя бы один статус"})
+		return
+	}
+
+	outputFile := strings.TrimSpace(req.OutputFile)
+	if outputFile == "" {
+		outputFile = "result.xlsx"
+	}
+	downloadDir := strings.TrimSpace(req.DownloadDir)
+	if downloadDir == "" {
+		downloadDir = "downloads"
+	}
+	errorLogFile := ""
+
+	sendLog := func(message string) error {
+		log.Print(message)
+		if errorLogFile != "" && isProblemLog(message) {
+			if err := appendLine(errorLogFile, time.Now().Format(time.RFC3339)+" "+message); err != nil {
+				log.Printf("не удалось сохранить лог ошибки: %v", err)
+			}
+		}
+		return writeServerJSON(conn, wsMessage{Type: "log", Message: message})
+	}
+	sendProgress := func(current, total int, status string) error {
+		if current < 0 {
+			current = 0
+		}
+		if current > total {
+			current = total
+		}
+		return writeServerJSON(conn, wsMessage{
+			Type:    "progress",
+			Current: current,
+			Total:   total,
+			Status:  status,
+		})
+	}
+
+	if err := os.MkdirAll(downloadDir, 0755); err != nil {
+		_ = writeServerJSON(conn, wsMessage{Type: "error", Message: fmt.Sprintf("не удалось создать папку %s: %v", downloadDir, err)})
+		return
+	}
+	errorLogFile = filepath.Join(downloadDir, "errors_"+time.Now().Format("20060102_150405")+".log")
+	if err := sendLog("[INFO] Error log file: " + errorLogFile); err != nil {
+		return
+	}
+	if err := sendProgress(1, 100, "Подготовка"); err != nil {
+		return
+	}
+
+	files, stats, err := runExecProcExport(req.SessionKey, startDate, statuses, downloadDir, sendLog, sendProgress)
+	if err != nil {
+		_ = writeServerJSON(conn, wsMessage{Type: "error", Message: err.Error()})
+		return
+	}
+	if len(files) == 0 {
+		_ = writeServerJSON(conn, wsMessage{Type: "error", Message: "по выбранным статусам данные не найдены"})
+		return
+	}
+
+	if err := sendLog("[INFO] Merging Excel files..."); err != nil {
+		return
+	}
+	if err := sendProgress(92, 100, "Объединение Excel"); err != nil {
+		return
+	}
+	rows, removed, err := mergeExecProcFiles(files)
+	if err != nil {
+		_ = writeServerJSON(conn, wsMessage{Type: "error", Message: err.Error()})
+		return
+	}
+	if err := sendLog(fmt.Sprintf("[INFO] Removing duplicates... removed: %d", removed)); err != nil {
+		return
+	}
+	finalRows := len(rows) - 1
+	if err := sendLog(fmt.Sprintf("[INFO] Full page totalElements: %d", stats.FullTotal)); err != nil {
+		return
+	}
+	if err := sendLog(fmt.Sprintf("[INFO] Leaf range totalElements: %d", stats.LeafTotal)); err != nil {
+		return
+	}
+	if err := sendLog(fmt.Sprintf("[INFO] Exported rows before merge dedupe: %d", stats.ExportedRows)); err != nil {
+		return
+	}
+	if err := sendLog(fmt.Sprintf("[INFO] Final rows after dedupe: %d", finalRows)); err != nil {
+		return
+	}
+	if err := sendLog(fmt.Sprintf("[INFO] Skipped ranges: %d", stats.SkippedRanges)); err != nil {
+		return
+	}
+	if err := sendProgress(96, 100, "Сохранение результата"); err != nil {
+		return
+	}
+
+	xlsxBytes, err := buildXLSXBytes([]sheetData{{Name: "Результаты", Rows: rows}})
+	if err != nil {
+		_ = writeServerJSON(conn, wsMessage{Type: "error", Message: err.Error()})
+		return
+	}
+	if err := os.WriteFile(outputFile, xlsxBytes, 0644); err != nil {
+		_ = writeServerJSON(conn, wsMessage{Type: "error", Message: fmt.Sprintf("не удалось сохранить %s: %v", outputFile, err)})
+		return
+	}
+	if err := sendLog("[INFO] Saved " + outputFile); err != nil {
+		return
+	}
+	if err := sendProgress(100, 100, "Готово"); err != nil {
+		return
+	}
+
+	_ = writeServerJSON(conn, wsMessage{
+		Type:       "result",
+		FileName:   filepath.Base(outputFile),
+		FileBase64: base64.StdEncoding.EncodeToString(xlsxBytes),
+		Processed:  finalRows,
+		Failed:     removed,
+	})
+}
+
+type exportStats struct {
+	FullTotal     int
+	LeafTotal     int
+	ExportedRows  int
+	SkippedRanges int
+	mu            sync.Mutex
+}
+
+func (s *exportStats) addFullTotal(value int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.FullTotal += value
+}
+
+func (s *exportStats) addLeafTotal(value int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.LeafTotal += value
+}
+
+func (s *exportStats) addExportedRows(value int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ExportedRows += value
+}
+
+func (s *exportStats) addSkippedRange() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.SkippedRanges++
+}
+
+func runExecProcExport(session, startDate string, statuses []string, downloadDir string, sendLog func(string) error, sendProgress func(int, int, string) error) ([]string, *exportStats, error) {
+	stats := &exportStats{}
+	files := make([]string, 0)
+	endDate := time.Now().Format("2006-01-02")
+
+	for statusIndex, statusCode := range statuses {
+		statusLabel := statusCode
+		if statusLabel == "" {
+			statusLabel = "all"
+		}
+		statusStart := 2 + (88*statusIndex)/len(statuses)
+		statusPlanDone := statusStart + 22/len(statuses)
+		statusEnd := 2 + (88*(statusIndex+1))/len(statuses)
+
+		if err := sendProgress(statusStart, 100, "Планирование "+statusLabel); err != nil {
+			return files, stats, err
+		}
+
+		fullRange := dateRange{
+			From:  startDate,
+			To:    endDate,
+			Label: strings.ReplaceAll(startDate, "-", "_") + "_" + strings.ReplaceAll(endDate, "-", "_"),
+		}
+		fullSearchResult, err := searchDateRange(session, statusCode, fullRange, sendLog)
+		if err != nil {
+			return files, stats, err
+		}
+		stats.addFullTotal(fullSearchResult.TotalElements)
+		if err := sendLog(fmt.Sprintf("[INFO] Status %s full page totalElements: %d", statusLabel, fullSearchResult.TotalElements)); err != nil {
+			return files, stats, err
+		}
+
+		plannedRanges, err := planExportRanges(session, statusCode, statusLabel, fullRange, sendLog)
+		if err != nil {
+			return files, stats, err
+		}
+		if err := sendLog(fmt.Sprintf("[INFO] Planned ranges for status %s: %d", statusLabel, len(plannedRanges))); err != nil {
+			return files, stats, err
+		}
+		if err := sendProgress(statusPlanDone, 100, "Выгрузка "+statusLabel); err != nil {
+			return files, stats, err
+		}
+
+		downloadedFiles, err := downloadPlannedRanges(session, statusLabel, downloadDir, plannedRanges, sendLog, sendProgress, statusPlanDone, statusEnd, stats)
+		if err != nil {
+			return files, stats, err
+		}
+		files = append(files, downloadedFiles...)
+		if err := sendProgress(statusEnd, 100, "Status "+statusLabel+" готов"); err != nil {
+			return files, stats, err
+		}
+	}
+
+	return files, stats, nil
+}
+
+func planExportRanges(session, statusCode, statusLabel string, currentRange dateRange, sendLog func(string) error) ([]plannedRange, error) {
+	searchResult, err := searchDateRange(session, statusCode, currentRange, sendLog)
+	if err != nil {
+		return nil, wrapRangeError(statusLabel, currentRange, err)
+	}
+	if searchResult.TotalElements == 0 {
+		return nil, nil
+	}
+	if searchResult.TotalElements <= 10000 {
+		return []plannedRange{{Range: currentRange, Search: searchResult}}, nil
+	}
+
+	left, right, err := splitDateRange(currentRange)
+	if err != nil {
+		return nil, wrapRangeError(statusLabel, currentRange, err)
+	}
+	if err := sendLog(fmt.Sprintf("[INFO] Split range %s (%s - %s), totalElements=%d", currentRange.Label, currentRange.From, currentRange.To, searchResult.TotalElements)); err != nil {
+		return nil, err
+	}
+
+	result := make([]plannedRange, 0)
+	leftRanges, err := planExportRanges(session, statusCode, statusLabel, left, sendLog)
+	if err != nil {
+		return result, err
+	}
+	result = append(result, leftRanges...)
+	rightRanges, err := planExportRanges(session, statusCode, statusLabel, right, sendLog)
+	if err != nil {
+		return result, err
+	}
+	result = append(result, rightRanges...)
+	return result, nil
+}
+
+func downloadPlannedRanges(session, statusLabel, downloadDir string, ranges []plannedRange, sendLog func(string) error, sendProgress func(int, int, string) error, progressStart, progressEnd int, stats *exportStats) ([]string, error) {
+	files := make([]string, 0, len(ranges))
+	for idx, current := range ranges {
+		progress := progressStart
+		if len(ranges) > 0 {
+			progress = progressStart + ((progressEnd - progressStart) * (idx + 1) / len(ranges))
+		}
+		if err := sendProgress(progress, 100, "Скачивание "+current.Range.Label); err != nil {
+			return files, err
+		}
+		downloaded, err := exportPlannedRange(session, statusLabel, downloadDir, current, sendLog, stats)
+		if err != nil {
+			wrapped := wrapRangeError(statusLabel, current.Range, err)
+			if logErr := sendLog("[ERROR] Skipped " + wrapped.Error()); logErr != nil {
+				return files, logErr
+			}
+			stats.addSkippedRange()
+			continue
+		}
+		files = append(files, downloaded...)
+	}
+	return files, nil
+}
+
+func exportPlannedRange(session, statusLabel, downloadDir string, current plannedRange, sendLog func(string) error, stats *exportStats) ([]string, error) {
+	if strings.TrimSpace(current.Search.SearchID) == "" {
+		return nil, fmt.Errorf("searchId пустой при totalElements=%d", current.Search.TotalElements)
+	}
+
+	fileName := filepath.Join(downloadDir, fmt.Sprintf("status_%s_%s.xlsx", statusLabel, current.Range.Label))
+	if err := downloadExecProcExcel(session, current.Search.SearchID, fileName); err != nil {
+		return nil, err
+	}
+	if err := sendLog("[INFO] Downloaded: " + fileName); err != nil {
+		return nil, err
+	}
+
+	exportedRows, err := dataRowCountFromFile(fileName)
+	if err != nil {
+		return nil, err
+	}
+	if err := sendLog(fmt.Sprintf("[INFO] Exported rows: %d", exportedRows)); err != nil {
+		return nil, err
+	}
+	stats.addLeafTotal(current.Search.TotalElements)
+	stats.addExportedRows(exportedRows)
+	if exportedRows > current.Search.TotalElements {
+		if err := sendLog(fmt.Sprintf("[WARN] Range %s exported more rows than search totalElements: totalElements=%d exportedRows=%d", current.Range.Label, current.Search.TotalElements, exportedRows)); err != nil {
+			return nil, err
+		}
+	}
+	if current.Search.TotalElements > exportedRows && exportedRows >= 10000 {
+		if err := sendLog(fmt.Sprintf("[WARN] Range %s may be truncated: totalElements=%d exportedRows=%d", current.Range.Label, current.Search.TotalElements, exportedRows)); err != nil {
+			return nil, err
+		}
+	}
+
+	return []string{fileName}, nil
+}
+
+func wrapRangeError(statusLabel string, currentRange dateRange, err error) error {
+	return fmt.Errorf("status %s range %s (%s - %s): %w", statusLabel, currentRange.Label, currentRange.From, currentRange.To, err)
+}
+
+func searchDateRange(session, statusCode string, currentRange dateRange, sendLog func(string) error) (execProcSearchResult, error) {
+	searchResult, err := searchExecProc(session, currentRange.From, currentRange.To, statusCode, sendLog)
+	if err != nil {
+		return execProcSearchResult{}, err
+	}
+	if err := sendLog(fmt.Sprintf("[INFO] Found totalElements: %d", searchResult.TotalElements)); err != nil {
+		return execProcSearchResult{}, err
+	}
+	if err := sendLog("[INFO] searchId: " + searchResult.SearchID); err != nil {
+		return execProcSearchResult{}, err
+	}
+	return searchResult, nil
+}
+
+type dateRange struct {
+	From  string
+	To    string
+	Label string
+}
+
+type plannedRange struct {
+	Range  dateRange
+	Search execProcSearchResult
+}
+
+func splitDateRange(currentRange dateRange) (dateRange, dateRange, error) {
+	start, err := time.Parse("2006-01-02", currentRange.From)
+	if err != nil {
+		return dateRange{}, dateRange{}, err
+	}
+	end, err := time.Parse("2006-01-02", currentRange.To)
+	if err != nil {
+		return dateRange{}, dateRange{}, err
+	}
+	if !start.Before(end) {
+		return dateRange{}, dateRange{}, fmt.Errorf("диапазон %s нельзя разделить дальше", currentRange.Label)
+	}
+
+	days := int(end.Sub(start).Hours()/24) + 1
+	leftDays := days / 2
+	if leftDays < 1 {
+		leftDays = 1
+	}
+	leftEnd := start.AddDate(0, 0, leftDays-1)
+	rightStart := leftEnd.AddDate(0, 0, 1)
+	return newDateRange(start, leftEnd), newDateRange(rightStart, end), nil
+}
+
+func newDateRange(start, end time.Time) dateRange {
+	from := start.Format("2006-01-02")
+	to := end.Format("2006-01-02")
+	label := strings.ReplaceAll(from, "-", "_")
+	if from != to {
+		label += "_" + strings.ReplaceAll(to, "-", "_")
+	}
+	return dateRange{
+		From:  from,
+		To:    to,
+		Label: label,
+	}
+}
+
+type execProcSearchResult struct {
+	TotalElements int
+	SearchID      string
+}
+
+func searchExecProc(session, fromDate, toDate, statusCode string, sendLog func(string) error) (execProcSearchResult, error) {
+	searchType := strings.TrimSpace(statusCode) != ""
+	payload := map[string]any{
+		"fromDate":   fromDate,
+		"toDate":     toDate,
+		"searchType": searchType,
+	}
+	if strings.TrimSpace(statusCode) != "" {
+		payload["statusCode"] = statusCode
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return execProcSearchResult{}, err
+	}
+	if sendLog != nil {
+		if err := sendLog("[DEBUG] Search curl: " + buildSearchCurl(session, string(body))); err != nil {
+			return execProcSearchResult{}, err
+		}
+	}
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/rest/execproc/search?page=0&size=5", bytes.NewReader(body))
+	if err != nil {
+		return execProcSearchResult{}, err
+	}
+	addExecProcHeaders(req, session)
+	req.Header.Set("Content-Type", "application/json")
+
+	client, err := getHTTPClient()
+	if err != nil {
+		return execProcSearchResult{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return execProcSearchResult{}, fmt.Errorf("ошибка поиска status=%s from=%s: %w", statusCode, fromDate, err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return execProcSearchResult{}, fmt.Errorf("не удалось прочитать ответ поиска: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return execProcSearchResult{}, fmt.Errorf("поиск вернул статус %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	var parsed struct {
+		Pagination struct {
+			TotalElements int    `json:"totalElements"`
+			SearchID      string `json:"searchId"`
+		} `json:"pagination"`
+	}
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return execProcSearchResult{}, fmt.Errorf("не удалось разобрать ответ поиска: %w", err)
+	}
+
+	return execProcSearchResult{
+		TotalElements: parsed.Pagination.TotalElements,
+		SearchID:      parsed.Pagination.SearchID,
+	}, nil
+}
+
+func buildSearchCurl(session, body string) string {
+	return "curl 'https://aisoip.adilet.gov.kz/extperson/api/rest/execproc/search?page=0&size=5' " +
+		"-H 'Accept: application/json, text/plain, */*' " +
+		"-H 'Accept-Language: ru' " +
+		"-H 'Content-Type: application/json' " +
+		"-b 'SESSION=" + maskSecret(session) + "' " +
+		"-H 'Origin: https://aisoip.adilet.gov.kz' " +
+		"-H 'Referer: https://aisoip.adilet.gov.kz/cabinet/exec-productions' " +
+		"--data-raw '" + strings.ReplaceAll(body, "'", "'\\''") + "'"
+}
+
+func maskSecret(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 12 {
+		return "***"
+	}
+	return value[:6] + "..." + value[len(value)-6:]
+}
+
+func downloadExecProcExcel(session, searchID, fileName string) error {
+	u, err := url.Parse(baseURL + "/api/rest/export/excel")
+	if err != nil {
+		return err
+	}
+	query := u.Query()
+	query.Set("searchtype", "false")
+	query.Set("page", "0")
+	query.Set("size", "50000")
+	query.Set("searchid", searchID)
+	query.Set("lang", "ru")
+	u.RawQuery = query.Encode()
+
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	addExecProcHeaders(req, session)
+
+	client, err := getHTTPClient()
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("ошибка скачивания Excel searchId=%s: %w", searchID, err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("не удалось прочитать Excel: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("Excel endpoint вернул статус %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	if len(data) < 4 || string(data[:2]) != "PK" {
+		return fmt.Errorf("Excel не скачался: ответ не похож на .xlsx, размер %d байт", len(data))
+	}
+
+	if err := os.WriteFile(fileName, data, 0644); err != nil {
+		return fmt.Errorf("не удалось сохранить %s: %w", fileName, err)
+	}
+	return nil
+}
+
+func addExecProcHeaders(req *http.Request, session string) {
+	req.AddCookie(&http.Cookie{Name: "SESSION", Value: session})
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "ru")
+	req.Header.Set("Origin", "https://aisoip.adilet.gov.kz")
+	req.Header.Set("Referer", "https://aisoip.adilet.gov.kz/cabinet/exec-productions")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36")
+}
+
+func normalizeStatuses(statuses []string) []string {
+	allowed := map[string]struct{}{"1": {}, "2": {}, "3": {}, "50": {}, "51": {}, "52": {}}
+	if len(statuses) == 0 {
+		return []string{""}
+	}
+	seen := make(map[string]struct{})
+	result := make([]string, 0, len(statuses))
+	for _, status := range statuses {
+		status = strings.TrimSpace(status)
+		if status == "" {
+			return []string{""}
+		}
+		if _, ok := allowed[status]; !ok {
+			continue
+		}
+		if _, ok := seen[status]; ok {
+			continue
+		}
+		seen[status] = struct{}{}
+		result = append(result, status)
+	}
+	return result
+}
+
+func maxExcitationDateFromFile(fileName string) (string, error) {
+	data, err := os.ReadFile(fileName)
+	if err != nil {
+		return "", err
+	}
+	rows, err := readXLSXRowsBytes(data)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", nil
+	}
+	dateIndex := findHeaderIndex(rows[0], "Дата возбуждения")
+	if dateIndex < 0 {
+		return "", errors.New("в Excel нет колонки «Дата возбуждения»")
+	}
+	maxDate := ""
+	for i := 1; i < len(rows); i++ {
+		if dateIndex >= len(rows[i]) {
+			continue
+		}
+		value := normalizeExcelDate(rows[i][dateIndex])
+		if value > maxDate {
+			maxDate = value
+		}
+	}
+	return maxDate, nil
+}
+
+func dataRowCountFromFile(fileName string) (int, error) {
+	data, err := os.ReadFile(fileName)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := readXLSXRowsBytes(data)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, row := range rows[1:] {
+		if rowHasAnyValue(row) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func rowHasAnyValue(row []string) bool {
+	for _, value := range row {
+		if strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeExecProcFiles(files []string) ([][]string, int, error) {
+	files = append([]string(nil), files...)
+	sort.Strings(files)
+
+	var header []string
+	uniqueRows := make([][]string, 0)
+	seen := make(map[string]string)
+	removed := 0
+
+	for _, fileName := range files {
+		data, err := os.ReadFile(fileName)
+		if err != nil {
+			return nil, removed, err
+		}
+		rows, err := readXLSXRowsBytes(data)
+		if err != nil {
+			return nil, removed, fmt.Errorf("%s: %w", fileName, err)
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		if header == nil {
+			header = rows[0]
+		}
+		keyIndexes := duplicateKeyIndexes(rows[0])
+		for _, row := range rows[1:] {
+			key := duplicateKey(row, keyIndexes)
+			if strings.TrimSpace(key) == "" {
+				key = duplicateFallbackKey(row)
+			}
+			if firstFile, ok := seen[key]; ok {
+				if firstFile != fileName {
+					removed++
+					continue
+				}
+			} else {
+				seen[key] = fileName
+			}
+			uniqueRows = append(uniqueRows, row)
+		}
+	}
+
+	if header == nil {
+		return nil, removed, errors.New("нет строк для объединения")
+	}
+	return append([][]string{header}, uniqueRows...), removed, nil
+}
+
+func duplicateKeyIndexes(header []string) []int {
+	if idx := findHeaderIndex(header, "execProcId"); idx >= 0 {
+		return []int{idx}
+	}
+	return nil
+}
+
+func duplicateFallbackKey(row []string) string {
+	if len(row) <= 1 {
+		return strings.Join(row, "\x1f")
+	}
+	return strings.Join(row[1:], "\x1f")
+}
+
+func duplicateKey(row []string, indexes []int) string {
+	parts := make([]string, 0, len(indexes))
+	for _, idx := range indexes {
+		if idx >= len(row) {
+			parts = append(parts, "")
+			continue
+		}
+		parts = append(parts, strings.TrimSpace(row[idx]))
+	}
+	return strings.Join(parts, "\x1f")
+}
+
+func findHeaderIndex(header []string, name string) int {
+	target := strings.ToLower(strings.TrimSpace(name))
+	for idx, value := range header {
+		if strings.ToLower(strings.TrimSpace(value)) == target {
+			return idx
+		}
+	}
+	return -1
+}
+
+func findFirstHeaderIndex(header []string, names ...string) int {
+	for _, name := range names {
+		if idx := findHeaderIndex(header, name); idx >= 0 {
+			return idx
+		}
+	}
+	return -1
+}
+
 func readNumbersFromXLSXBytes(data []byte) ([]string, error) {
+	rows, err := readXLSXRowsBytes(data)
+	if err == nil {
+		numbers := make([]string, 0, len(rows))
+		for _, row := range rows {
+			if len(row) == 0 {
+				continue
+			}
+			value := strings.TrimSpace(row[0])
+			if value == "" {
+				continue
+			}
+			lowerValue := strings.ToLower(value)
+			if lowerValue == "number" || strings.Contains(lowerValue, "номер") {
+				continue
+			}
+			numbers = append(numbers, value)
+		}
+		return numbers, nil
+	}
+
 	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return nil, fmt.Errorf("не удалось открыть xlsx: %w", err)
@@ -591,6 +1340,69 @@ func readNumbersFromXLSXBytes(data []byte) ([]string, error) {
 	}
 
 	return numbers, nil
+}
+
+func readXLSXRowsBytes(data []byte) ([][]string, error) {
+	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, fmt.Errorf("не удалось открыть xlsx: %w", err)
+	}
+
+	sharedStrings, _ := readSharedStrings(reader)
+	sheetXML, err := readZipFile(reader, "xl/worksheets/sheet1.xml")
+	if err != nil {
+		return nil, err
+	}
+
+	var sheet xlsxWorksheet
+	if err := xml.Unmarshal(sheetXML, &sheet); err != nil {
+		return nil, fmt.Errorf("не удалось прочитать sheet1.xml: %w", err)
+	}
+
+	rows := make([][]string, 0, len(sheet.SheetData.Rows))
+	for _, sourceRow := range sheet.SheetData.Rows {
+		row := make([]string, 0, len(sourceRow.Cells))
+		for fallbackIdx, cell := range sourceRow.Cells {
+			colIdx := fallbackIdx
+			if parsedIdx := cellColumnIndex(cell.Ref); parsedIdx >= 0 {
+				colIdx = parsedIdx
+			}
+			for len(row) <= colIdx {
+				row = append(row, "")
+			}
+			row[colIdx] = strings.TrimSpace(resolveCellValue(cell, sharedStrings))
+		}
+		rows = append(rows, row)
+	}
+
+	return rows, nil
+}
+
+func cellColumnIndex(ref string) int {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return -1
+	}
+	result := 0
+	seenLetter := false
+	for _, r := range ref {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			result = result*26 + int(r-'A'+1)
+			seenLetter = true
+		case r >= 'a' && r <= 'z':
+			result = result*26 + int(r-'a'+1)
+			seenLetter = true
+		default:
+			if seenLetter {
+				return result - 1
+			}
+		}
+	}
+	if !seenLetter {
+		return -1
+	}
+	return result - 1
 }
 
 func readSharedStrings(reader *zip.Reader) ([]string, error) {
@@ -874,6 +1686,20 @@ func firstNonEmpty(values ...string) string {
 
 func buildUnhandledFileName() string {
 	return "unhandled_data_" + time.Now().Format("20060102_150405") + ".json"
+}
+
+func isProblemLog(message string) bool {
+	return strings.HasPrefix(message, "[ERROR]") || strings.HasPrefix(message, "[WARN]")
+}
+
+func appendLine(fileName, line string) error {
+	file, err := os.OpenFile(fileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = file.WriteString(line + "\n")
+	return err
 }
 
 func appendBankArrestRows(rows [][]string, parsed map[string]any, fallbackExecProcNum string) [][]string {
@@ -1249,6 +2075,43 @@ func formatDisplayDate(value string) string {
 	}
 
 	return value
+}
+
+func normalizeExcelDate(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+
+	formats := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02",
+		"02.01.2006",
+		"02/01/2006",
+		"01/02/2006",
+	}
+	for _, format := range formats {
+		parsed, err := time.Parse(format, value)
+		if err == nil {
+			return parsed.Format("2006-01-02")
+		}
+	}
+
+	if len(value) >= len("2006-01-02") {
+		prefix := value[:10]
+		parsed, err := time.Parse("2006-01-02", prefix)
+		if err == nil {
+			return parsed.Format("2006-01-02")
+		}
+	}
+
+	if serial, err := strconv.ParseFloat(strings.ReplaceAll(value, ",", "."), 64); err == nil && serial > 1 {
+		base := time.Date(1899, 12, 30, 0, 0, 0, 0, time.UTC)
+		return base.Add(time.Duration(serial*24) * time.Hour).Format("2006-01-02")
+	}
+
+	return ""
 }
 
 func stringifyValue(v any) string {
